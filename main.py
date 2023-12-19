@@ -11,7 +11,7 @@ torch.manual_seed(1337)
 # Use the GPU if possible
 # device = "mps" if torch.backends.mps.is_available() else "cpu"
 device = "cpu"
-# Maximum context length for preditions
+# Maximum context length for predictions
 block_size = 32
 # How many independent sequences we'll process in parallel. This translates to
 # how many rows will be in the final tensor we send for training.
@@ -21,21 +21,28 @@ max_iters = 10_000
 # Evaluation check point every
 eval_interval = 500
 eval_iters = 200
+# Embedding dimensions
+n_embeds = 32
 
 
 class BigramLanguageModel(nn.Module):
     def __init__(self, vocab_size) -> None:
         super().__init__()
-        self.token_embedding_table = nn.Embedding(vocab_size, vocab_size)
+        self.token_embedding_table = nn.Embedding(vocab_size, n_embeds)
+        self.lm_head = nn.Linear(n_embeds, vocab_size)
 
     def forward(self, idx, targets=None):
         # idx and targets have shape (B,T)
 
-        # logits have shape (B,T,H) with
+        # embeddings and logits have shape (B,T,C) with
         # B being batch size
         # T being block size (aka TIME)
-        # H being embedding_dim (vocab_size in our case)
-        logits = self.token_embedding_table(idx)
+        # and for embeddings
+        # C being the size of the embed (n_embeds in our case)
+        tok_embeds = self.token_embedding_table(idx)
+        # while for logits
+        # C being embedding_dim (vocab_size in our case)
+        logits = self.lm_head(tok_embeds)
 
         if targets is None:
             # When this method is called from `generate`, we won't have the targets
