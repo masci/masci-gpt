@@ -28,21 +28,30 @@ n_embeds = 32
 class BigramLanguageModel(nn.Module):
     def __init__(self, vocab_size) -> None:
         super().__init__()
+        # This is for encoding the id of the token
         self.token_embedding_table = nn.Embedding(vocab_size, n_embeds)
+        # This is for encoding the position of the token in the context
+        self.position_embedding_table = nn.Embedding(block_size, n_embeds)
         self.lm_head = nn.Linear(n_embeds, vocab_size)
 
     def forward(self, idx, targets=None):
         # idx and targets have shape (B,T)
+        B, T = idx.shape
 
         # embeddings and logits have shape (B,T,C) with
         # B being batch size
         # T being block size (aka TIME)
-        # and for embeddings
-        # C being the size of the embed (n_embeds in our case)
+        #
+        # for the embeddings C is the size of the embed (n_embeds in our case)
         tok_embeds = self.token_embedding_table(idx)
-        # while for logits
-        # C being embedding_dim (vocab_size in our case)
-        logits = self.lm_head(tok_embeds)
+        pos_embeds = self.position_embedding_table(
+            torch.arange(T, device=device)  # this is 0, 1, 2, ..., Tmax-1
+        )  # shape is (T,C)
+        #
+        # before decoding the logits, we combine token and position
+        x = tok_embeds + pos_embeds  #  torch will get us (B, T, C)
+        # for the logits C is the embedding_dim (vocab_size in our case)
+        logits = self.lm_head(x)
 
         if targets is None:
             # When this method is called from `generate`, we won't have the targets
