@@ -17,12 +17,49 @@ block_size = 32
 # how many rows will be in the final tensor we send for training.
 batch_size = 4
 # Training iterations
-max_iters = 10_000
+max_iters = 5_000
 # Evaluation check point every
 eval_interval = 500
 eval_iters = 200
 # Embedding dimensions
 n_embeds = 32
+# Learning rate
+learning_rate = 1e-3
+
+
+class Head(nn.Module):
+    """
+    One head of self-attention
+    """
+
+    def __init__(self, head_size):
+        super().__init__()
+
+        self.key = nn.Linear(n_embeds, head_size, bias=False)
+        self.query = nn.Linear(n_embeds, head_size, bias=False)
+        self.value = nn.Linear(n_embeds, head_size, bias=False)
+        self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
+
+    def forward(self, x):
+        B, T, C = x.shape
+        # k is the vector representing the what a token contains
+        k = self.key(x)  # (B,T,C)
+        # q is the vector representing what the token is looking for
+        q = self.query(x)  # (B,T,C)
+
+        # so far, there was no communication between tokens, this will happen now
+        # by computing the dot product between keys and queries
+
+        # compute the attention scores (or affinities). We divide for the square root of C to normalize
+        wei = q @ k.transpose(-2, -1) * C**-0.5  # (B,T,C) @ (B,C,T) -> (B,T,T)
+        # the masking is what makes this layer a decoder block: no communication is allowed with "future" tokens
+        wei = wei.masked_fill(self.tril[:T, :T] == 0, float("-inf"))  # still (B,T,T)
+        wei = F.softmax(wei, dim=-1)  # (B,T,T)
+        # perform the weighted aggregations of the values. Value is what the token "declares"
+        # as the information it carries
+        v = self.value(x)  # (B,T,C)
+        out = wei @ v  # (B,T,T) @ (B,T,C) --> (B,T,C)
+        return out
 
 
 class BigramLanguageModel(nn.Module):
@@ -32,6 +69,7 @@ class BigramLanguageModel(nn.Module):
         self.token_embedding_table = nn.Embedding(vocab_size, n_embeds)
         # This is for encoding the position of the token in the context
         self.position_embedding_table = nn.Embedding(block_size, n_embeds)
+        self.sa_head = Head(n_embeds)
         self.lm_head = nn.Linear(n_embeds, vocab_size)
 
     def forward(self, idx, targets=None):
@@ -50,7 +88,9 @@ class BigramLanguageModel(nn.Module):
         #
         # before decoding the logits, we combine token and position
         x = tok_embeds + pos_embeds  #  torch will get us (B, T, C)
-        # for the logits C is the embedding_dim (vocab_size in our case)
+        # after encoding the tokens and their positions, we feed them into the self-attention head
+        x = self.sa_head(x)  # (B,T,C)
+        # for the logits, C is the embedding_dim (vocab_size in our case)
         logits = self.lm_head(x)
 
         if targets is None:
@@ -69,7 +109,9 @@ class BigramLanguageModel(nn.Module):
 
     def generate(self, idx, max_new_tokens):
         for _ in range(max_new_tokens):
-            logits, loss = self(idx)
+            # crop idx to the last block_size tokens
+            idx_cond = idx[:, -block_size:]
+            logits, loss = self(idx_cond)
             logits = logits[:, -1, :]
             probs = F.softmax(logits, dim=-1)
             idx_next = torch.multinomial(probs, num_samples=1)
@@ -179,7 +221,7 @@ def main():
 
     # The generation above was garbage, let's train the model
 
-    optimizer = torch.optim.AdamW(m.parameters(), lr=1e-3)
+    optimizer = torch.optim.AdamW(m.parameters(), lr=learning_rate)
     for step in range(max_iters):
         # monitor the loss every few steps
         if step % eval_interval == 0:
