@@ -9,22 +9,26 @@ torch.manual_seed(1337)
 # hyperparameters
 #
 # Use the GPU if possible
-# device = "mps" if torch.backends.mps.is_available() else "cpu"
-device = "cpu"
+device = "mps" if torch.backends.mps.is_available() else "cpu"
+# device = "cpu"
 # Maximum context length for predictions
-block_size = 32
+block_size = 256
 # How many independent sequences we'll process in parallel. This translates to
 # how many rows will be in the final tensor we send for training.
-batch_size = 4
+batch_size = 64
 # Training iterations
 max_iters = 5_000
 # Evaluation check point every
 eval_interval = 500
 eval_iters = 200
 # Embedding dimensions
-n_embeds = 32
+n_embeds = 384
 # Learning rate
-learning_rate = 1e-3
+learning_rate = 3e-4
+# Number of heads
+n_heads = 6
+# Number of layers
+n_layers = 6
 
 
 class Head(nn.Module):
@@ -34,10 +38,11 @@ class Head(nn.Module):
 
     def __init__(self, head_size):
         super().__init__()
-
+        # Create the linear layers (or linear projections) that we'll apply to all our nodes
         self.key = nn.Linear(n_embeds, head_size, bias=False)
         self.query = nn.Linear(n_embeds, head_size, bias=False)
         self.value = nn.Linear(n_embeds, head_size, bias=False)
+        # 'tril' shouldn't be a parameter of the model, so we store it as a Pytorch "buffer"
         self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
 
     def forward(self, x):
@@ -51,6 +56,8 @@ class Head(nn.Module):
         # by computing the dot product between keys and queries
 
         # compute the attention scores (or affinities). We divide for the square root of C to normalize
+        # the scores. This is very important specially at init time, to avoid having un-evenly distributed
+        # values, otherwise Softmax will converge to the extremes.
         wei = q @ k.transpose(-2, -1) * C**-0.5  # (B,T,C) @ (B,C,T) -> (B,T,T)
         # the masking is what makes this layer a decoder block: no communication is allowed with "future" tokens
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float("-inf"))  # still (B,T,T)
@@ -62,6 +69,68 @@ class Head(nn.Module):
         return out
 
 
+class MultiHeadAttention(nn.Module):
+    """
+    Multiple heads of self-attention in parallel
+    """
+
+    def __init__(self, num_heads, head_size):
+        super().__init__()
+        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+        self.proj = nn.Linear(n_embeds, n_embeds)  # this is for skip connections
+
+    def forward(self, x):
+        out = torch.cat([h(x) for h in self.heads], dim=-1)
+        out = self.proj(out)
+        return out
+
+
+class FeedForward(nn.Module):
+    """
+    Simple linear layer followed by a non-linearity.
+    This operates on every single token in isolation.
+    """
+
+    def __init__(self, n_embeds) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_embeds, 4 * n_embeds),
+            nn.ReLU(),
+            nn.Linear(
+                4 * n_embeds, n_embeds
+            ),  # this is to project back after the skip connection
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class Block(nn.Module):
+    """
+    Transformer block: communication followed by computation
+    """
+
+    def __init__(self, n_embeds, num_heads):
+        super().__init__()
+        head_size = n_embeds // num_heads
+        self.sa = MultiHeadAttention(num_heads, head_size)
+        self.ffwd = FeedForward(n_embeds)
+        self.ln1 = nn.LayerNorm(n_embeds)
+        self.ln2 = nn.LayerNorm(n_embeds)
+
+    def forward(self, x):
+        # We implement skip connections (or residual connections). We fork off the computation
+        # and project back into the residual pathway via addition. At the beginning of the
+        # optimization these take precendence over the transformer blocks speeding up optimizations.
+        # then they start to kick in later.
+        #
+        # Note: in the transformer paper the normalization happens after the transformation,
+        # but it's common these days to apply normalization before
+        x = x + self.sa(self.ln1(x))  # fork off, communicate, come back
+        x = x + self.ffwd(self.ln2(x))  # fork off, compute, come back
+        return x
+
+
 class BigramLanguageModel(nn.Module):
     def __init__(self, vocab_size) -> None:
         super().__init__()
@@ -69,7 +138,17 @@ class BigramLanguageModel(nn.Module):
         self.token_embedding_table = nn.Embedding(vocab_size, n_embeds)
         # This is for encoding the position of the token in the context
         self.position_embedding_table = nn.Embedding(block_size, n_embeds)
-        self.sa_head = Head(n_embeds)
+        # Transformer blocks
+        self.blocks = nn.Sequential(
+            *[Block(n_embeds, n_heads) for _ in range(n_layers)]
+        )
+        self.ln = nn.LayerNorm(n_embeds)
+
+        # We create the Self Attention multi-heads.
+        # We divide the number of embeddings by the number of heads so that when
+        # we concatenate at the end we got the original 32 dimensions
+        self.sa_heads = MultiHeadAttention(4, n_embeds // 4)
+        self.ffwd = FeedForward(n_embeds)
         self.lm_head = nn.Linear(n_embeds, vocab_size)
 
     def forward(self, idx, targets=None):
@@ -88,9 +167,16 @@ class BigramLanguageModel(nn.Module):
         #
         # before decoding the logits, we combine token and position
         x = tok_embeds + pos_embeds  #  torch will get us (B, T, C)
-        # after encoding the tokens and their positions, we feed them into the self-attention head
-        x = self.sa_head(x)  # (B,T,C)
-        # for the logits, C is the embedding_dim (vocab_size in our case)
+        # # after encoding the tokens and their positions, we feed them into the self-attention head
+        # x = self.sa_heads(x)  # (B,T,C)
+        # # feed forward
+        # x = self.ffwd(x)
+        # We replace the two calls above with a call to our transformer blocks
+        x = self.blocks(x)
+        x = self.ln(x)
+
+        # The output of the self-attention head goes into the decoder language modeling head to create
+        # the logits. For the logits, C is the embedding_dim (vocab_size in our case)
         logits = self.lm_head(x)
 
         if targets is None:
@@ -109,12 +195,19 @@ class BigramLanguageModel(nn.Module):
 
     def generate(self, idx, max_new_tokens):
         for _ in range(max_new_tokens):
-            # crop idx to the last block_size tokens
+            # crop idx to the last block_size tokens. If idx is larger than block_size,
+            # our positional embedding table will run out of scope, because it has embeddings
+            # only for tokens up to block_size
             idx_cond = idx[:, -block_size:]
+            # Get the predictions
             logits, loss = self(idx_cond)
+            # Focus only on the last time step
             logits = logits[:, -1, :]
+            # Apply softmax to get probabilities
             probs = F.softmax(logits, dim=-1)
+            # Sample from the distribution
             idx_next = torch.multinomial(probs, num_samples=1)
+            # Append sampled index to the running sequence
             idx = torch.cat((idx, idx_next), dim=1)
         return idx
 
